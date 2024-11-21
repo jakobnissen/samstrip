@@ -1,0 +1,8 @@
+[package]
+name = "samstrip"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.21", features = ["derive"] }
+memchr = "2.7.4"
