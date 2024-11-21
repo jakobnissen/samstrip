@@ -2,7 +2,12 @@ use clap::Parser;
 use core::str;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 
+// Iterates over tab-separated fields in u8 slice. This uses memchr for efficiency.
 struct FieldIterator<'a> {
+    // None if the iterator has no more elements to output,
+    // because the previous iteration emitted the remainder of the slice.
+    // This allows us to distinguish between 'the iterator is done' and
+    // 'there is one more element, it just happens to be empty'
     bytes: Option<&'a [u8]>,
 }
 
@@ -19,7 +24,9 @@ impl<'a> Iterator for FieldIterator<'a> {
         if let Some(mem) = self.bytes {
             if let Some(next_pos) = memchr::memchr(b'\t', mem) {
                 let (res, new) = mem.split_at(next_pos);
-                // Safety: New is guaranteed to be nonempty by the semantics of split_at
+                // Safety: Since the memchr found a tab at next_pos, next_pos is a valid index
+                // into mem. Therefore, by the behaviour of `split_at`, new can't be empty,
+                // and therefore this cannot be out of bounds
                 unsafe { self.bytes = Some(new.get_unchecked(1..new.len())) }
                 Some(res)
             } else {
@@ -56,6 +63,8 @@ fn main() {
             Some(convert_tags(strtags))
         }
     };
+    // Buffering the writer leads to a large speedup. Buffering the reader also gives
+    // a small speedup
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(io::stdout().lock());
     let mut line = write_header(&mut stdout, &mut stdin, cli.noheader);
@@ -72,12 +81,15 @@ fn main() {
         let mut needs_newline = true;
         if let Some(ref tags) = keep_tags {
             // Loop over the last fields - skip the first two SEQ and QUAL fields which we replaced above,
-            // and then look for the NM:i field which should always be present. If we find it, copy it
-            // to the out buffer.
+            // and then look for all aux fields that begin with any tag in `tag` (which we should keep).
             let fields = FieldIterator::new(&line[start + 1..]);
             for field in fields.skip(2).filter(|f| starts_with_tag(f, tags)) {
                 unwrap_pipe(stdout.write_all(b"\t"));
                 unwrap_pipe(stdout.write_all(field));
+                // We know at most one field can end with a newline (because we process one line
+                // at a time). If such a field is found, it must be the last field, and so
+                // needs_newline will be false when this loop is exited, such that we don't get
+                // two newlines written.
                 needs_newline = *field.last().unwrap() != b'\n';
             }
         }
@@ -89,8 +101,10 @@ fn main() {
     }
 }
 
+// Returns the first non-header line (or an empty Vec, if no such line)
 fn write_header<O: Write, I: BufRead>(out: &mut O, inp: &mut I, noheader: bool) -> Vec<u8> {
     let first_byte = inp.fill_buf().unwrap().first().copied();
+    // Unless --noheader is passed, error if the first byte exists but is not a @
     if !noheader && first_byte.is_some_and(|b| b != b'@') {
         eprintln!(
         "Error: First SAM line did not start with a @, indicating a missing header. \
@@ -105,6 +119,9 @@ fn write_header<O: Write, I: BufRead>(out: &mut O, inp: &mut I, noheader: bool) 
         if !line.starts_with(b"@") {
             break;
         };
+        // For PG headers, we need a unique ID field. We write them in the format "samstrip.X",
+        // where X is some u32. Since it must be unique, we need to keep track of what versions
+        // we've already seen in the file, so we can pick the first version not in the file
         if line.starts_with(b"@PG\t") {
             if let Some(ver) = FieldIterator::new(&line)
                 .find(|sl| sl.starts_with(b"ID"))
@@ -118,6 +135,11 @@ fn write_header<O: Write, I: BufRead>(out: &mut O, inp: &mut I, noheader: bool) 
         unwrap_pipe(out.write_all(&line));
         line.clear();
     }
+    // The idea here is that after sorting and dedupping, seen_versions must correspond contain the
+    // number 0..seen_versions.len(), UNLESS a version is missing.
+    // So, the first unseen version is: The first element in seen_versions that is not equal to its
+    // index, or if no such element exist, it's the length of `seen_versions` (i.e. the next element
+    // that would have been added to the vec)
     seen_versions.sort_unstable();
     // Technically this should already be deduplicated, because samstrip will never write
     // a PG ID that already exists. Nonetheless, we do it anyway for safety's sake.
@@ -133,6 +155,9 @@ fn write_header<O: Write, I: BufRead>(out: &mut O, inp: &mut I, noheader: bool) 
     line
 }
 
+// This is useful for consumers of the stripped SAM file, because they probably wonder
+// where all the fields went. The PG header will tell them that this SAM file was processed
+// with samstrip, and which version, and what the program "samstrip" even is.
 fn write_pg_header<O: Write>(out: &mut O, id: u32) {
     let command_line = std::env::args()
         .map(|arg| arg.as_str().to_string())
@@ -149,6 +174,8 @@ fn write_pg_header<O: Write>(out: &mut O, id: u32) {
     unwrap_pipe(out.write_all(line.as_bytes()));
 }
 
+// SAM aux tags are two ASCII alphanumerical symbols. We encode them in a u16, so we can check
+// for their presence more quickly.
 fn convert_tags(tags: Vec<String>) -> Vec<u16> {
     tags.iter().map(|tag| {
         match tag.as_bytes() {
@@ -166,8 +193,16 @@ fn starts_with_tag(mem: &[u8], tags: &[u16]) -> bool {
         eprintln!("Error: Could not parse SAM auxiliary field: Less than two bytes in length");
         std::process::exit(1)
     }
-    // Safety: We read first two elements and just checked there are at least two
+    // Safety: We read first two elements and just checked there are at least two elements.
+    // Note that this works correctly for both big- and little endian platforms,
+    // but it's more efficient for little-endian ones.
     let u = unsafe { (*mem.get_unchecked(0) as u16) | ((*mem.get_unchecked(1) as u16) << 8) };
+    // We could use tags.contain(&u), but this implementation SIMDs.
+    // That probably won't matter in 99% of cases, but the user could pass a long list of tags,
+    // in which case it would.
+    // SIMD'ing does not degrade performance measurably, because the extra branches related to whether
+    // the SIMD loop should kick in is constant across the program's run, and therefore will be almost
+    // perfectly predicted by the branch predictor.
     tags.iter().fold(false, |acc, &t| acc | (t == u))
 }
 
