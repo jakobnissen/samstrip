@@ -30,3 +30,5 @@ $ cat in | samstrip > out # default: keep tag 'NM' only
 $ cat in | samstrip --keep NM AS rl > out # keep tags 'NM', 'AS', 'rl'
 $ cat in | samstrip --keep > out # do not keep any tags
 ```
+* `--remove`: Same as `--keep`, but only remove the given tags. If an empty list of tags is passed,
+  don't remove any tags. Incompatible with `--keep`.

@@ -23,12 +23,14 @@ impl<'a> Iterator for FieldIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(mem) = self.bytes {
             if let Some(next_pos) = memchr::memchr(b'\t', mem) {
-                let (res, new) = mem.split_at(next_pos);
                 // Safety: Since the memchr found a tab at next_pos, next_pos is a valid index
-                // into mem. Therefore, by the behaviour of `split_at`, new can't be empty,
-                // and therefore this cannot be out of bounds
-                unsafe { self.bytes = Some(new.get_unchecked(1..new.len())) }
-                Some(res)
+                // into mem. Therefore, by the behaviour of `split_at_unchecked`,
+                // new can't be empty, and therefore this cannot be out of bounds
+                unsafe {
+                    let (res, new) = mem.split_at_unchecked(next_pos);
+                    self.bytes = Some(new.get_unchecked(1..new.len()));
+                    Some(res)
+                }
             } else {
                 self.bytes.take()
             }
@@ -42,27 +44,84 @@ impl<'a> Iterator for FieldIterator<'a> {
 #[derive(Parser)]
 #[command(author, version, about, long_about = HELP_MESSAGE)]
 struct Cli {
-    /// List of auxiliary tags to keep in file (default: NM)
+    /// List of aux tags to keep in file (default: NM)
     #[arg(long, num_args(0..))]
     keep: Option<Vec<String>>,
+
+    /// List of aux tags to remove (incompatible with --keep)
+    #[arg(long, num_args(0..))]
+    remove: Option<Vec<String>>,
 
     /// Allow input without SAM header
     #[arg(long, default_value_t = false)]
     noheader: bool,
 }
 
+enum Tags {
+    KeepAll,
+    RemoveAll,
+    Keep(Vec<u16>),
+    Remove(Vec<u16>),
+}
+
+impl Tags {
+    fn new(keep: Option<Vec<String>>, remove: Option<Vec<String>>) -> Self {
+        match (keep, remove) {
+            (Some(_), Some(_)) => {
+                eprintln!("Error: Cannot pass both arguments --keep and --remove.");
+                std::process::exit(1);
+            }
+            (None, None) => Self::Keep(convert_tags(vec!["NM".to_string()])),
+            (Some(k), None) => {
+                if k.is_empty() {
+                    Self::RemoveAll
+                } else {
+                    Self::Keep(convert_tags(k))
+                }
+            }
+            (None, Some(r)) => {
+                if r.is_empty() {
+                    Self::KeepAll
+                } else {
+                    Self::Remove(convert_tags(r))
+                }
+            }
+        }
+    }
+
+    fn add_fields<W: Write>(&self, io: &mut W, line: &[u8]) {
+        let mut need_newline = true;
+        match self {
+            Self::RemoveAll => (),
+            Self::KeepAll => {
+                unwrap_pipe(io.write_all(b"\t"));
+                unwrap_pipe(io.write_all(line));
+                need_newline = false;
+            }
+            Self::Keep(k) => {
+                for mem in FieldIterator::new(line).filter(|m| starts_with_tag(m, k)) {
+                    unwrap_pipe(io.write_all(b"\t"));
+                    unwrap_pipe(io.write_all(mem));
+                    need_newline = mem.last().map_or(false, |&b| b != b'\n');
+                }
+            }
+            Self::Remove(r) => {
+                for mem in FieldIterator::new(line).filter(|m| !starts_with_tag(m, r)) {
+                    unwrap_pipe(io.write_all(b"\t"));
+                    unwrap_pipe(io.write_all(mem));
+                    need_newline = mem.last().map_or(false, |&b| b != b'\n');
+                }
+            }
+        }
+        if need_newline {
+            unwrap_pipe(io.write_all(b"\n"));
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
-    // Basically, if user didn't pass it in, default to NM, if user explicitly passed
-    // an empty list of tags, return None.
-    let keep_tags = {
-        let strtags = cli.keep.unwrap_or(vec!["NM".to_string()]);
-        if strtags.is_empty() {
-            None
-        } else {
-            Some(convert_tags(strtags))
-        }
-    };
+    let tags = Tags::new(cli.keep, cli.remove);
     // Buffering the writer leads to a large speedup. Buffering the reader also gives
     // a small speedup
     let mut stdin = BufReader::new(io::stdin().lock());
@@ -71,29 +130,19 @@ fn main() {
     while !line.is_empty() {
         // Write the line from the start to the 9th tab, as the first 9 fields
         // should be copied over unchanged
-        let start = memchr::memchr_iter(b'\t', &line).nth(8).unwrap_or_else(|| {
+        let ninth = memchr::memchr_iter(b'\t', &line).nth(8).unwrap_or_else(|| {
             eprintln!("Error: In SAM alignment line, did not see all required fields");
             std::process::exit(1)
         });
-        unwrap_pipe(stdout.write_all(&line[..=start]));
+        unwrap_pipe(stdout.write_all(&line[..=ninth]));
         // The 10th and 11th field are SEQ and QUAL - we replace them with *
         unwrap_pipe(stdout.write_all(b"*\t*"));
-        let mut needs_newline = true;
-        if let Some(ref tags) = keep_tags {
-            // Loop over the last fields - skip the first two SEQ and QUAL fields which we replaced above,
-            // and then look for all aux fields that begin with any tag in `tag` (which we should keep).
-            let fields = FieldIterator::new(&line[start + 1..]);
-            for field in fields.skip(2).filter(|f| starts_with_tag(f, tags)) {
-                unwrap_pipe(stdout.write_all(b"\t"));
-                unwrap_pipe(stdout.write_all(field));
-                // We know at most one field can end with a newline (because we process one line
-                // at a time). If such a field is found, it must be the last field, and so
-                // needs_newline will be false when this loop is exited, such that we don't get
-                // two newlines written.
-                needs_newline = *field.last().unwrap() != b'\n';
-            }
-        }
-        if needs_newline {
+        if let Some(aux_mem) = memchr::memchr_iter(b'\t', &line[ninth + 1..])
+            .nth(1)
+            .map(|eleventh| &line[eleventh + ninth + 2..])
+        {
+            tags.add_fields(&mut stdout, aux_mem);
+        } else {
             unwrap_pipe(stdout.write_all(b"\n"));
         }
         line.clear();
@@ -124,9 +173,8 @@ fn write_header<O: Write, I: BufRead>(out: &mut O, inp: &mut I, noheader: bool) 
         // we've already seen in the file, so we can pick the first version not in the file
         if line.starts_with(b"@PG\t") {
             if let Some(ver) = FieldIterator::new(&line)
-                .find(|sl| sl.starts_with(b"ID"))
-                .and_then(|mem| str::from_utf8(mem).ok())
-                .and_then(|s| s.strip_prefix("ID:samstrip."))
+                .find(|mem| mem.starts_with(b"ID:samstrip."))
+                .and_then(|mem| str::from_utf8(&mem[b"ID:samstrip.".len()..]).ok())
                 .and_then(|s| s.parse::<u32>().ok())
             {
                 seen_versions.push(ver)
@@ -230,12 +278,15 @@ A stripped file has the SEQ and QUAL fields removed, and all auxiliary fields.
 Barring any aligner-specific auxiliary fields, a stripped SAM file contain the same
 alignment information as a full file, but takes up less disk space.
 
-The program optionally takes `-k`, a list of auxiliary tags to keep in the output.
+The program optionally takes `--keep`, a list of auxiliary tags to keep in the output.
 This defaults to 'NM', which many tools assume is always present.
 Examples:
 `cat in | samstrip > out` - default: keep tag 'NM' only
 `cat in | samstrip --keep NM AS rl > out` - keep tags 'NM', 'AS', 'rl'
 `cat in | samstrip --keep > out` - do not keep any tags
+
+Similarly, the `--remove` option only removes the given tags. If no tags are passed,
+all tags are kept.
 
 Example usage:
 Stripping an exiting BAM file:
