@@ -2,6 +2,9 @@ use clap::Parser;
 use core::str;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 
+// These are the errors that the `samstrip` function can throw. The only reason it's
+// not implemented with an enum instead of simply exiting when the error is encountered
+// is so it's more easily tested.
 #[derive(Debug)]
 enum SamError {
     TooFewFields,
@@ -9,6 +12,7 @@ enum SamError {
     BadAuxTag,
 }
 
+// When we actually enounter the error in non-test code, we just exit the program.
 impl SamError {
     fn exit(self) {
         match self {
@@ -87,6 +91,8 @@ struct Cli {
     noheader: bool,
 }
 
+// Which auxiliary fields are kept. Either we keep only those in a given set, or
+// we remove only those of a given set.
 enum Tags {
     KeepAll,
     RemoveAll,
@@ -95,31 +101,54 @@ enum Tags {
 }
 
 impl Tags {
+    // The arguments here correspond to what was passed on command line
     fn new(keep: Option<Vec<String>>, remove: Option<Vec<String>>) -> Self {
         match (keep, remove) {
             (Some(_), Some(_)) => {
                 eprintln!("Error: Cannot pass both arguments --keep and --remove.");
                 std::process::exit(1);
             }
-            (None, None) => Self::Keep(convert_tags(vec!["NM".to_string()])),
+            // By default we keep only the NM tag, because it's recommended in the
+            // SAM spec that this field exists, and many downstream tools rely on it
+            // being present.
+            (None, None) => Self::Keep(Self::convert_tags(vec!["NM".to_string()])),
             (Some(k), None) => {
+                // Keep none == remove all
                 if k.is_empty() {
                     Self::RemoveAll
                 } else {
-                    Self::Keep(convert_tags(k))
+                    Self::Keep(Self::convert_tags(k))
                 }
             }
             (None, Some(r)) => {
+                // Remove none == keep all
                 if r.is_empty() {
                     Self::KeepAll
                 } else {
-                    Self::Remove(convert_tags(r))
+                    Self::Remove(Self::convert_tags(r))
                 }
             }
         }
     }
 
+    // SAM aux tags are two ASCII alphanumerical symbols. We encode them in a u16, so we can check
+    // for their presence more quickly.
+    fn convert_tags(tags: Vec<String>) -> Vec<u16> {
+        tags.iter().map(|tag| {
+            match tag.as_bytes() {
+                [x @ (b'A'..=b'Z' | b'a'..=b'z'), y @ (b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9')] => {
+                    (*x as u16) | ((*y as u16) << 8)
+                },
+                _ => {eprintln!("Error: Tag argument \"{}\" does not conform to SAM specified regex [A-Za-z][A-Za-z0-9]", tag);
+                std::process::exit(1)},
+            }
+        }).collect()
+    }
+
+    // Write all aux fields contained in `line` to the IO
     fn add_fields<W: Write>(&self, io: &mut W, line: &[u8]) -> Result<(), SamError> {
+        // The last added field may or may not include a newline, meaning we might
+        // or might not need to manually add it at the end
         let mut need_newline = true;
         match self {
             Self::RemoveAll => (),
@@ -130,19 +159,19 @@ impl Tags {
             }
             Self::Keep(k) => {
                 for mem in FieldIterator::new(line) {
-                    if starts_with_tag(mem, k)? {
+                    if Self::starts_with_tag(mem, k)? {
                         unwrap_pipe(io.write_all(b"\t"));
                         unwrap_pipe(io.write_all(mem));
-                        need_newline = mem.last().map_or(false, |&b| b != b'\n');
+                        need_newline = mem.last().is_some_and(|&b| b != b'\n');
                     }
                 }
             }
             Self::Remove(r) => {
                 for mem in FieldIterator::new(line) {
-                    if !starts_with_tag(mem, r)? {
+                    if !Self::starts_with_tag(mem, r)? {
                         unwrap_pipe(io.write_all(b"\t"));
                         unwrap_pipe(io.write_all(mem));
-                        need_newline = mem.last().map_or(false, |&b| b != b'\n');
+                        need_newline = mem.last().is_some_and(|&b| b != b'\n');
                     }
                 }
             }
@@ -152,8 +181,26 @@ impl Tags {
         }
         Ok(())
     }
+
+    fn starts_with_tag(mem: &[u8], tags: &[u16]) -> Result<bool, SamError> {
+        if mem.len() < 2 {
+            return Err(SamError::BadAuxTag);
+        }
+        // Safety: We read first two elements and just checked there are at least two elements.
+        // Note that this works correctly for both big- and little endian platforms,
+        // but it's more efficient for little-endian ones.
+        let u = unsafe { (*mem.get_unchecked(0) as u16) | ((*mem.get_unchecked(1) as u16) << 8) };
+        // We could use tags.contain(&u), but this implementation SIMDs.
+        // That probably won't matter in 99% of cases, but the user could pass a long list of tags,
+        // in which case it would.
+        // SIMD'ing does not degrade performance measurably, because the extra branches related to whether
+        // the SIMD loop should kick in is constant across the program's run, and therefore will be almost
+        // perfectly predicted by the branch predictor.
+        Ok(tags.iter().fold(false, |acc, &t| acc | (t == u)))
+    }
 }
 
+// Essentially the main function, just refactored out so it's more testable
 fn samstrip<I: BufRead, W: Write>(
     inp: &mut I,
     out: &mut W,
@@ -184,6 +231,7 @@ fn samstrip<I: BufRead, W: Write>(
     Ok(())
 }
 
+// A CLI wrapper around the samstrip function.
 fn main() {
     let cli = Cli::parse();
     let tags = Tags::new(cli.keep, cli.remove);
@@ -272,37 +320,6 @@ fn write_pg_header<O: Write>(out: &mut O, id: u32) {
         description,
     );
     unwrap_pipe(out.write_all(line.as_bytes()));
-}
-
-// SAM aux tags are two ASCII alphanumerical symbols. We encode them in a u16, so we can check
-// for their presence more quickly.
-fn convert_tags(tags: Vec<String>) -> Vec<u16> {
-    tags.iter().map(|tag| {
-        match tag.as_bytes() {
-            [x @ (b'A'..=b'Z' | b'a'..=b'z'), y @ (b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9')] => {
-                (*x as u16) | ((*y as u16) << 8)
-            },
-            _ => {eprintln!("Error: Tag argument \"{}\" does not conform to SAM specified regex [A-Za-z][A-Za-z0-9]", tag);
-            std::process::exit(1)},
-        }
-    }).collect()
-}
-
-fn starts_with_tag(mem: &[u8], tags: &[u16]) -> Result<bool, SamError> {
-    if mem.len() < 2 {
-        return Err(SamError::BadAuxTag);
-    }
-    // Safety: We read first two elements and just checked there are at least two elements.
-    // Note that this works correctly for both big- and little endian platforms,
-    // but it's more efficient for little-endian ones.
-    let u = unsafe { (*mem.get_unchecked(0) as u16) | ((*mem.get_unchecked(1) as u16) << 8) };
-    // We could use tags.contain(&u), but this implementation SIMDs.
-    // That probably won't matter in 99% of cases, but the user could pass a long list of tags,
-    // in which case it would.
-    // SIMD'ing does not degrade performance measurably, because the extra branches related to whether
-    // the SIMD loop should kick in is constant across the program's run, and therefore will be almost
-    // perfectly predicted by the branch predictor.
-    Ok(tags.iter().fold(false, |acc, &t| acc | (t == u)))
 }
 
 // This is necessary because stdout may decide to stop allowing more input. E.g. if
@@ -533,7 +550,7 @@ Examples:
 `cat in | samstrip --keep NM AS rl > out` - keep tags 'NM', 'AS', 'rl'
 `cat in | samstrip --keep > out` - do not keep any tags
 
-Similarly, the `--remove` option only removes the given tags. If no tags are passed,
+Similarly, the `--remove` option only removes the given tags. If no tags are passed
 to `--remove`, all tags are kept.
 
 Example usage:
